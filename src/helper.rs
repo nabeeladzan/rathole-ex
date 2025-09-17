@@ -59,13 +59,17 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
 }
 
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
-    let semi = s.rfind(':').expect("missing semicolon");
-    Ok((&s[..semi], s[semi + 1..].parse()?))
+    let semi = s
+        .rfind(':')
+        .ok_or_else(|| anyhow!("Missing ':' in address: {}", s))?;
+    let port = s[semi + 1..]
+        .parse()
+        .with_context(|| format!("Invalid port number in address: {}", s))?;
+    Ok((&s[..semi], port))
 }
 
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
-
     let (socket_addr, bind_addr);
 
     match prefer_ipv6 {
@@ -76,7 +80,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             };
-        },
+        }
         true => {
             let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
@@ -85,7 +89,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 Some(socket_addr_ipv6) => {
                     socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
-                },
+                }
                 None => {
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {
@@ -102,7 +106,6 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
     };
     let s = UdpSocket::bind(bind_addr).await?;
     s.connect(socket_addr).await?;
-    s.connect(socket_addr).await?;
     Ok(s)
 }
 
@@ -114,11 +117,13 @@ pub async fn tcp_connect_with_proxy(
 ) -> Result<TcpStream> {
     if let Some(url) = proxy {
         let addr = &addr.addr;
-        let mut s = TcpStream::connect((
-            url.host_str().expect("proxy url should have host field"),
-            url.port().expect("proxy url should have port field"),
-        ))
-        .await?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("Proxy url should have host field"))?;
+        let port = url
+            .port()
+            .ok_or_else(|| anyhow!("Proxy url should have port field"))?;
+        let mut s = TcpStream::connect((host, port)).await?;
 
         let auth = if !url.username().is_empty() || url.password().is_some() {
             Some(async_socks5::Auth {
@@ -148,7 +153,7 @@ pub async fn tcp_connect_with_proxy(
                     None => http_connect_tokio(&mut s, host, port).await?,
                 }
             }
-            _ => panic!("unknown proxy scheme"),
+            _ => return Err(anyhow!(format!("Unknown proxy scheme: {}", url.scheme()))),
         }
         Ok(s)
     } else {
