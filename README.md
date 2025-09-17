@@ -19,7 +19,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 - [rathole](#rathole)
   - [Features](#features)
-  - [Quickstart](#quickstart)
+- [Quickstart](#quickstart)
+  - [Embedding in Rust applications](#embedding-in-rust-applications)
   - [Configuration](#configuration)
     - [Logging](#logging)
     - [Tuning](#tuning)
@@ -90,6 +91,68 @@ Then run:
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
 To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+
+## Embedding in Rust applications
+
+`rathole` can also be hosted directly inside another Tokio application without spawning the CLI
+binary. Use [`EmbeddedClient::spawn`](https://docs.rs/rathole/latest/rathole/struct.EmbeddedClient.html)
+and [`EmbeddedServer::spawn`](https://docs.rs/rathole/latest/rathole/struct.EmbeddedServer.html) to
+start in-memory instances that you can control programmatically.
+
+```rust,no_run
+use rathole::{
+    ClientConfig, ClientServiceConfig, EmbeddedClient, EmbeddedServer, MaskedString,
+    ServerConfig, ServerServiceConfig,
+};
+use std::collections::HashMap;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Configure the embedded client.
+    let mut client_cfg = ClientConfig {
+        remote_addr: "127.0.0.1:2333".into(),
+        default_token: Some(MaskedString::from("super-secret-token")),
+        services: HashMap::new(),
+        ..Default::default()
+    };
+    client_cfg.services.insert(
+        "web".into(),
+        ClientServiceConfig {
+            local_addr: "127.0.0.1:8080".into(),
+            ..ClientServiceConfig::with_name("web")
+        },
+    );
+
+    let client = EmbeddedClient::spawn(client_cfg)?;
+
+    // Configure the embedded server in the same process (optional).
+    let mut server_cfg = ServerConfig {
+        bind_addr: "0.0.0.0:2333".into(),
+        services: HashMap::new(),
+        ..Default::default()
+    };
+    server_cfg.services.insert(
+        "web".into(),
+        ServerServiceConfig {
+            bind_addr: "0.0.0.0:8080".into(),
+            ..ServerServiceConfig::with_name("web")
+        },
+    );
+
+    let server = EmbeddedServer::spawn(server_cfg)?;
+
+    // Clean up when your application is shutting down.
+    server.shutdown();
+    client.shutdown();
+    server.wait().await?;
+    client.wait().await?;
+
+    Ok(())
+}
+```
+
+The helper methods on the handles allow you to add or remove services at runtime, hook into the
+shared shutdown broadcast, or stop the embedded instance explicitly with [`stop`](https://docs.rs/rathole/latest/rathole/struct.EmbeddedClient.html#method.stop).
 
 ## Configuration
 

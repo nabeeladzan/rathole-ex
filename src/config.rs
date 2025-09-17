@@ -237,6 +237,22 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn from_client_config(mut client: ClientConfig) -> Result<Config> {
+        Config::validate_client_config(&mut client)?;
+        Ok(Config {
+            server: None,
+            client: Some(client),
+        })
+    }
+
+    pub fn from_server_config(mut server: ServerConfig) -> Result<Config> {
+        Config::validate_server_config(&mut server)?;
+        Ok(Config {
+            server: Some(server),
+            client: None,
+        })
+    }
+
     fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
@@ -391,6 +407,48 @@ mod tests {
             let s = fs::read_to_string(p)?;
             assert!(Config::from_str(&s).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_client_config() -> Result<()> {
+        let mut client = ClientConfig::default();
+        client.remote_addr = "127.0.0.1:2333".into();
+        client.default_token = Some("abc".into());
+        client.services.insert(
+            "svc".into(),
+            ClientServiceConfig {
+                local_addr: "127.0.0.1:8080".into(),
+                ..Default::default()
+            },
+        );
+
+        let cfg = Config::from_client_config(client)?;
+        let prepared = cfg.client.expect("client config present");
+        let svc = prepared.services.get("svc").expect("service exists");
+        assert_eq!(svc.name, "svc");
+        assert_eq!(svc.token.as_deref(), Some("abc"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_server_config() -> Result<()> {
+        let mut server = ServerConfig::default();
+        server.bind_addr = "0.0.0.0:2333".into();
+        server.default_token = Some("xyz".into());
+        server.services.insert(
+            "svc".into(),
+            ServerServiceConfig {
+                bind_addr: "0.0.0.0:8080".into(),
+                ..Default::default()
+            },
+        );
+
+        let cfg = Config::from_server_config(server)?;
+        let prepared = cfg.server.expect("server config present");
+        let svc = prepared.services.get("svc").expect("service exists");
+        assert_eq!(svc.name, "svc");
+        assert_eq!(svc.token.as_deref(), Some("xyz"));
         Ok(())
     }
 
