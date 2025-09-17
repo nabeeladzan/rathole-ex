@@ -1,6 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::udp_connect;
+use crate::helper::{udp_connect, write_and_flush};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -203,10 +203,17 @@ async fn do_data_channel_handshake<T: Transport>(
     T::hint(&conn, args.socket_opts);
 
     // Send nonce
-    let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
-    let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
-    conn.flush().await?;
+    if args.session_key.len() != HASH_WIDTH_IN_BYTES {
+        bail!("Invalid session key length");
+    }
+    let mut session_key = [0u8; HASH_WIDTH_IN_BYTES];
+    session_key.copy_from_slice(&args.session_key);
+    let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, session_key);
+    let hello_bytes =
+        bincode::serialize(&hello).with_context(|| "Failed to serialize data channel hello")?;
+    write_and_flush(&mut conn, &hello_bytes)
+        .await
+        .with_context(|| "Failed to send data channel hello")?;
 
     Ok(conn)
 }
@@ -227,7 +234,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,7 +263,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -325,8 +337,22 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
 
         // Now there should be a udp forwarder that can receive the packet
         let m = port_map.read().await;
+        let mut stale_mapping = false;
         if let Some(tx) = m.get(&packet.from) {
-            let _ = tx.send(packet.data).await;
+            if let Err(e) = tx.send(packet.data.clone()).await {
+                debug!(from = %packet.from, "Failed to forward UDP packet: {:?}", e);
+                stale_mapping = true;
+            }
+        } else {
+            stale_mapping = true;
+        }
+        drop(m);
+
+        if stale_mapping {
+            let mut m = port_map.write().await;
+            if m.remove(&packet.from).is_some() {
+                debug!(from = %packet.from, "Removed stale UDP forwarder");
+            }
         }
     }
 }
@@ -415,11 +441,12 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Send hello
         debug!("Sending hello");
-        let hello_send =
-            Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
-            .await?;
-        conn.flush().await?;
+        let hello_send = Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest);
+        let hello_bytes = bincode::serialize(&hello_send)
+            .with_context(|| "Failed to serialize control channel hello")?;
+        write_and_flush(&mut conn, &hello_bytes)
+            .await
+            .with_context(|| "Failed to send control channel hello")?;
 
         // Read hello
         debug!("Reading hello");
@@ -432,13 +459,21 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Send auth
         debug!("Sending auth");
-        let mut concat = Vec::from(self.service.token.as_ref().unwrap().as_bytes());
+        let token = self
+            .service
+            .token
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing service token"))?;
+        let mut concat = Vec::from(token.as_bytes());
         concat.extend_from_slice(&nonce);
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
-        conn.flush().await?;
+        let auth_bytes =
+            bincode::serialize(&auth).with_context(|| "Failed to serialize auth digest")?;
+        write_and_flush(&mut conn, &auth_bytes)
+            .await
+            .with_context(|| "Failed to send auth digest")?;
 
         // Read ack
         debug!("Reading ack");
@@ -507,7 +542,15 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let retry_interval_secs = service.retry_interval.unwrap_or_else(|| {
+            warn!(
+                service = %service.name,
+                "retry_interval missing in configuration, falling back to 1s"
+            );
+            1
+        });
+
+        let mut retry_backoff = run_control_chan_backoff(retry_interval_secs);
 
         let mut s = ControlChannel {
             digest,
@@ -540,8 +583,8 @@ impl ControlChannelHandle {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
                     } else {
-                        // Should never reach
-                        panic!("{:#}. Break", err);
+                        error!("{:#}. Control channel backoff exhausted, giving up", err);
+                        break;
                     }
 
                     start = Instant::now();

@@ -17,7 +17,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -285,24 +285,26 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     T::hint(&conn, SocketOpts::for_control_channel());
 
     // Generate a nonce
-    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
+    let mut nonce = [0u8; HASH_WIDTH_IN_BYTES];
     rand::thread_rng().fill_bytes(&mut nonce);
 
     // Send hello
-    let hello_send = Hello::ControlChannelHello(
-        protocol::CURRENT_PROTO_VERSION,
-        nonce.clone().try_into().unwrap(),
-    );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
-    conn.flush().await?;
+    let hello_send = Hello::ControlChannelHello(protocol::CURRENT_PROTO_VERSION, nonce);
+    let hello_bytes = bincode::serialize(&hello_send)
+        .with_context(|| "Failed to serialize control channel hello")?;
+    write_and_flush(&mut conn, &hello_bytes)
+        .await
+        .with_context(|| "Failed to send control channel hello")?;
 
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
-                .await?;
+            let not_exist = bincode::serialize(&Ack::ServiceNotExist)
+                .with_context(|| "Failed to serialize service-not-exist ack")?;
+            write_and_flush(&mut conn, &not_exist)
+                .await
+                .with_context(|| "Failed to send service-not-exist ack")?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
     }
@@ -311,8 +313,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let service_name = &service_config.name;
 
     // Calculate the checksum
-    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
-    concat.append(&mut nonce);
+    let token = service_config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing service token"))?;
+    let mut concat = Vec::from(token.as_bytes());
+    concat.extend_from_slice(&nonce);
 
     // Read auth
     let protocol::Auth(d) = read_auth(&mut conn).await?;
@@ -320,8 +326,11 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
-            .await?;
+        let auth_failed = bincode::serialize(&Ack::AuthFailed)
+            .with_context(|| "Failed to serialize auth-failed ack")?;
+        write_and_flush(&mut conn, &auth_failed)
+            .await
+            .with_context(|| "Failed to send auth-failed ack")?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
@@ -343,9 +352,11 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
+        let ok_ack =
+            bincode::serialize(&Ack::Ok).with_context(|| "Failed to serialize success ack")?;
+        write_and_flush(&mut conn, &ok_ack)
+            .await
+            .with_context(|| "Failed to send success ack")?;
 
         info!(service = %service_config.name, "Control channel established");
         let handle =
@@ -453,7 +464,7 @@ where
                         shutdown_rx_clone,
                     )
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
+                    .with_context(|| "Failed to run UDP connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -506,8 +517,10 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel)
+            .with_context(|| "Failed to serialize CreateDataChannel command")?;
+        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat)
+            .with_context(|| "Failed to serialize HeartBeat command")?;
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -630,7 +643,8 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp)
+        .with_context(|| "Failed to serialize StartForwardTcp command")?;
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
@@ -656,11 +670,32 @@ async fn run_tcp_connection_pool<T: Transport>(
     Ok(())
 }
 
+async fn take_udp_data_channel<T: Transport>(
+    data_ch_rx: &mut mpsc::Receiver<T::Stream>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    cmd: &[u8],
+) -> Result<T::Stream> {
+    loop {
+        match data_ch_rx.recv().await {
+            Some(mut conn) => match write_and_flush(&mut conn, cmd).await {
+                Ok(_) => return Ok(conn),
+                Err(e) => {
+                    debug!("Discarding broken UDP data channel: {:#}", e);
+                    if data_ch_req_tx.send(true).is_err() {
+                        bail!("Control channel closed");
+                    }
+                }
+            },
+            None => bail!("No available data channels"),
+        }
+    }
+}
+
 #[instrument(skip_all)]
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     // TODO: Load balance
@@ -678,14 +713,12 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp)
+        .with_context(|| "Failed to serialize StartForwardUdp command")?;
 
     // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    let mut conn: T::Stream =
+        take_udp_data_channel::<T>(&mut data_ch_rx, &data_ch_req_tx, &cmd).await?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
@@ -693,13 +726,43 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                if let Err(e) = UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await {
+                    debug!("Failed to send UDP payload to client: {:#}", e);
+                    if data_ch_req_tx.send(true).is_err() {
+                        bail!("Control channel closed");
+                    }
+                    conn = take_udp_data_channel::<T>(&mut data_ch_rx, &data_ch_req_tx, &cmd).await?;
+                    UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                }
             },
 
             // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
+                let hdr_len = match hdr_len {
+                    Ok(len) => len,
+                    Err(e) => {
+                        debug!("Failed to read UDP header length: {}", e);
+                        if data_ch_req_tx.send(true).is_err() {
+                            bail!("Control channel closed");
+                        }
+                        conn = take_udp_data_channel::<T>(&mut data_ch_rx, &data_ch_req_tx, &cmd).await?;
+                        continue;
+                    }
+                };
+
+                match UdpTraffic::read(&mut conn, hdr_len).await {
+                    Ok(t) => {
+                        l.send_to(&t.data, t.from).await?;
+                    }
+                    Err(e) => {
+                        debug!("Failed to read UDP payload: {:#}", e);
+                        if data_ch_req_tx.send(true).is_err() {
+                            bail!("Control channel closed");
+                        }
+                        conn = take_udp_data_channel::<T>(&mut data_ch_rx, &data_ch_req_tx, &cmd).await?;
+                        continue;
+                    }
+                }
             }
 
             _ = shutdown_rx.recv() => {
